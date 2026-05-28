@@ -1,0 +1,92 @@
+# .github/workflows/postdoc-agent.yml
+#
+# Free daily postdoc job agent — runs on GitHub Actions (free tier).
+# GitHub Actions free tier: 2,000 min/month for public repos (unlimited),
+# 500 min/month for private repos. This agent uses ~3–5 min/day = ~100 min/month.
+#
+# ── One-time setup ────────────────────────────────────────────────────────────
+# 1. Create a Telegram bot:
+#    - Open Telegram, search @BotFather
+#    - Send: /newbot  →  follow prompts  →  copy the token
+#
+# 2. Get your Telegram Chat ID:
+#    - Send /start to your new bot
+#    - Visit: https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
+#    - Copy the "id" value from the "chat" object
+#
+# 3. Add GitHub Secrets (repo → Settings → Secrets → Actions → New secret):
+#    - TELEGRAM_BOT_TOKEN  ← your bot token
+#    - TELEGRAM_CHAT_ID    ← your chat id
+#
+# 4. Push agent.py to the root of your repo (or adjust `run` path below).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Postdoc Job Agent
+
+on:
+  schedule:
+    # Runs daily at 07:30 UTC  (1 PM IST — good for evening check in India)
+    - cron: "30 7 * * *"
+
+  # Allows you to run manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  scrape-and-notify:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # needed to commit postdocs.db back to repo
+
+    steps:
+      # ── 1. Checkout repo ───────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can push back
+          fetch-depth: 0
+
+      # ── 2. Python setup ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 feedparser
+
+      # ── 4. Run the agent ───────────────────────────────────────────────────
+      - name: Run postdoc agent
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          DB_PATH: postdocs.db
+        run: python agent.py
+
+      # ── 5. Persist the SQLite DB back to the repo ─────────────────────────
+      # This is the "free database" — the .db file lives in your repo.
+      # New jobs accumulate across runs without any external storage.
+      - name: Commit updated database
+        run: |
+          git config --local user.email "postdoc-bot@github-actions"
+          git config --local user.name  "Postdoc Bot"
+          git add postdocs.db
+          # Only commit if there are actual changes (new jobs found)
+          git diff --staged --quiet || git commit -m "chore: update job listings $(date -I)"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 6. Optional: upload DB as an artifact for manual inspection ────────
+      - name: Upload database snapshot
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postdocs-db-${{ github.run_number }}
+          path: postdocs.db
+          retention-days: 30

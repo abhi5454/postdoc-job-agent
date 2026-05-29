@@ -88,17 +88,33 @@ POSTDOC_TITLE_PATTERNS = re.compile(
     r"postdoc|post-doc|post doc|"
     r"postdoctoral|post-doctoral|"
     r"research fellow|"
-    r"pdra|"                              # UK shorthand for Postdoctoral Research Associate
+    r"pdra|"                               # UK shorthand for Postdoctoral Research Associate
     r"junior\s+research\s+(chair|fellow)|"
-    r"marie\s+(sk.odowska-)?curie|"       # EU fellowship
+    r"marie\s+(sk.odowska-)?curie|"        # EU fellowship
     r"newton\s+fellow|"
     r"royal\s+society\s+fellow|"
-    r"research\s+associate.*\bphd\b",     # RA requiring a completed PhD
+    r"research\s+associate.*\bphd\b|"     # RA explicitly requiring a completed PhD
+    # ── Entry-level faculty (scope-equivalent to a postdoc) ────────────────
+    r"assistant\s+professor|"             # standard US / EU / Asia entry faculty
+    r"junior\s+professor|"               # Juniorprofessor W1 (Germany)
+    r"tenure.track|"                     # TT mentioned anywhere in title
+    r"visiting\s+assistant\s+professor|" # VAP — common postdoc bridge role
+    r"visiting\s+lecturer|"
+    r"lecturer\s+in\s+math|"            # UK Lecturer = entry faculty, NOT teaching-only RA
+    r"lecturer\s+in\s+pure|"
+    r"lecturer\s+in\s+applied|"
+    r"lecturer\s+in\s+probability|"
+    r"lecturer\s+in\s+combinatorics|"
+    r"lecturer\s+in\s+statistics|"
+    r"faculty\s+position|"
+    r"instructor.*math",                 # some US/CA depts use Instructor for entry roles
     re.IGNORECASE,
 )
 
 # ── Keywords that strongly suggest this is NOT a postdoc ────────────────────
-# A single match doesn't disqualify, but 2+ matches will.
+# A single match doesn't disqualify; 2+ matches apply a score penalty.
+# Note: "assistant professor", "lecturer in" intentionally removed —
+# those are now accepted as entry-level faculty equivalent to a postdoc.
 NEGATIVE_KEYWORDS = [
     "phd studentship",
     "phd scholarship",
@@ -109,12 +125,12 @@ NEGATIVE_KEYWORDS = [
     "research technician",
     "laboratory manager",
     "lab manager",
-    "senior lecturer",
-    "associate professor",
-    "assistant professor",
-    "lecturer in",
-    "professor of",
-    "data scientist",           # industry-facing RA roles
+    "senior lecturer",       # senior = not entry-level
+    "associate professor",   # mid-career, above postdoc band
+    "full professor",
+    "professor of",          # "Professor of Mathematics" = senior chair
+    "chair of",
+    "data scientist",        # industry-facing RA roles
     "software engineer",
     "part-time",
     "0.5 fte",
@@ -316,24 +332,30 @@ def is_likely_postdoc(title: str, full_text: str) -> bool:
     Checked before inserting into the DB or sending any notification.
 
     Logic:
-      1. If the title explicitly matches a known postdoc pattern → True
-      2. If the title contains negative signals (lecturer, professor, PhD student) → False
+      1. If the title explicitly matches a known postdoc/entry-faculty pattern → True
+         (includes assistant professor, junior professor, VAP, tenure-track, UK Lecturer)
+      2. If the title contains senior-role signals → False
+         (senior lecturer, associate professor, full professor, PhD student, technician)
       3. In the UK, 'Research Associate' IS the standard postdoc title at Grade 6/7,
-         so we allow it — but only when the full text mentions PhD/doctorate requirement.
-      4. Everything else that doesn't look like a postdoc → False
+         so allow it — but only when the full text mentions a PhD requirement.
+      4. Everything else without an explicit signal → False
     """
     title_lower = title.lower()
     text_lower  = full_text.lower()
 
-    # 1. Explicit postdoc language in title → always accept
+    # 1. Explicit postdoc / entry-level faculty language in title → always accept
     if POSTDOC_TITLE_PATTERNS.search(title):
         return True
 
     # 2. Hard negatives in title → always reject
+    #    Note: "lecturer" alone is NOT here — "Lecturer in Mathematics" is entry faculty.
+    #    "senior lecturer", "associate professor", "professor of" ARE here.
     hard_negatives = [
-        "phd", "studentship", "scholarship", "lecturer", "professor",
-        "technician", "manager", "engineer", "scientist",
-        "msc", "master", "undergraduate", "part-time",
+        "phd student", "studentship", "scholarship",
+        "senior lecturer", "associate professor", "full professor",
+        "professor of", "chair of", "emeritus",
+        "technician", "manager", "engineer", "data scientist",
+        "msc student", "master student", "undergraduate", "part-time",
     ]
     if any(neg in title_lower for neg in hard_negatives):
         return False
@@ -350,7 +372,7 @@ def is_likely_postdoc(title: str, full_text: str) -> bool:
         )
         return bool(phd_required)
 
-    # 4. Anything else without an explicit postdoc signal → reject
+    # 4. Anything else without an explicit postdoc/faculty signal → reject
     return False
 
 

@@ -82,6 +82,45 @@ SECONDARY_KEYWORDS = [
     "topological",       # Möbius/Klein grid topology angle
 ]
 
+# ── Title patterns that confirm a role IS a postdoc ─────────────────────────
+# Checked against the job TITLE only (not the full description).
+POSTDOC_TITLE_PATTERNS = re.compile(
+    r"postdoc|post-doc|post doc|"
+    r"postdoctoral|post-doctoral|"
+    r"research fellow|"
+    r"pdra|"                              # UK shorthand for Postdoctoral Research Associate
+    r"junior\s+research\s+(chair|fellow)|"
+    r"marie\s+(sk.odowska-)?curie|"       # EU fellowship
+    r"newton\s+fellow|"
+    r"royal\s+society\s+fellow|"
+    r"research\s+associate.*\bphd\b",     # RA requiring a completed PhD
+    re.IGNORECASE,
+)
+
+# ── Keywords that strongly suggest this is NOT a postdoc ────────────────────
+# A single match doesn't disqualify, but 2+ matches will.
+NEGATIVE_KEYWORDS = [
+    "phd studentship",
+    "phd scholarship",
+    "phd position",
+    "doctoral student",
+    "msc student",
+    "undergraduate",
+    "research technician",
+    "laboratory manager",
+    "lab manager",
+    "senior lecturer",
+    "associate professor",
+    "assistant professor",
+    "lecturer in",
+    "professor of",
+    "data scientist",           # industry-facing RA roles
+    "software engineer",
+    "part-time",
+    "0.5 fte",
+    "0.6 fte",
+]
+
 # ── Salary thresholds ────────────────────────────────────────────────────────
 MIN_SALARY_GBP = 30000   # filter out stipend-only or part-time
 MIN_SALARY_EUR = 35000
@@ -178,8 +217,11 @@ def get_all_jobs(conn: sqlite3.Connection) -> list:
 def score_relevance(text: str) -> tuple[int, list[str]]:
     """
     Returns (score, matched_keywords).
-    Primary keywords: +3 each.  Secondary: +1 each.
-    Bonus +2 if the word 'postdoc' or 'research associate' appears.
+    Primary keywords (dimer/combinatorics area): +3 each.
+    Secondary keywords: +1 each.
+    Explicit postdoc title words: +4 bonus.
+    Generic 'research associate' without postdoc context: +1 only.
+    Negative keywords: -3 each (caps at -9 total).
     """
     text_lower = text.lower()
     matched = []
@@ -195,8 +237,20 @@ def score_relevance(text: str) -> tuple[int, list[str]]:
             matched.append(kw)
             score += 1
 
-    if re.search(r"postdoc|post-doc|post doc|research associate|research fellow", text_lower):
-        score += 2
+    # Strong postdoc signal
+    if re.search(
+        r"postdoc|post-doc|post\s+doc|postdoctoral|post-doctoral|"
+        r"\bpdra\b|research\s+fellow|marie\s+curie|newton\s+fellow",
+        text_lower,
+    ):
+        score += 4
+    elif re.search(r"research\s+associate", text_lower):
+        # Generic RA — could be postdoc (UK norm) or not; minimal bonus
+        score += 1
+
+    # Negative keyword penalty
+    neg_hits = sum(1 for kw in NEGATIVE_KEYWORDS if kw in text_lower)
+    score -= min(neg_hits * 3, 9)
 
     return score, matched
 
@@ -256,7 +310,51 @@ def _get(url: str, params: dict | None = None, timeout: int = 20) -> requests.Re
         return None
 
 
-def _make_job(
+def is_likely_postdoc(title: str, full_text: str) -> bool:
+    """
+    Hard gate: returns False for roles that are clearly not postdocs.
+    Checked before inserting into the DB or sending any notification.
+
+    Logic:
+      1. If the title explicitly matches a known postdoc pattern → True
+      2. If the title contains negative signals (lecturer, professor, PhD student) → False
+      3. In the UK, 'Research Associate' IS the standard postdoc title at Grade 6/7,
+         so we allow it — but only when the full text mentions PhD/doctorate requirement.
+      4. Everything else that doesn't look like a postdoc → False
+    """
+    title_lower = title.lower()
+    text_lower  = full_text.lower()
+
+    # 1. Explicit postdoc language in title → always accept
+    if POSTDOC_TITLE_PATTERNS.search(title):
+        return True
+
+    # 2. Hard negatives in title → always reject
+    hard_negatives = [
+        "phd", "studentship", "scholarship", "lecturer", "professor",
+        "technician", "manager", "engineer", "scientist",
+        "msc", "master", "undergraduate", "part-time",
+    ]
+    if any(neg in title_lower for neg in hard_negatives):
+        return False
+
+    # 3. 'Research Associate' in title → accept only if job requires a completed PhD
+    if "research associate" in title_lower:
+        phd_required = re.search(
+            r"(completed|awarded|hold a|holding a|have a|recent)\s+ph\.?d|"
+            r"ph\.?d\s+(in|required|essential|qualification)|"
+            r"doctorate\s+(in|required|awarded)|"
+            r"must\s+have.*ph\.?d|"
+            r"applicants.*ph\.?d",
+            text_lower,
+        )
+        return bool(phd_required)
+
+    # 4. Anything else without an explicit postdoc signal → reject
+    return False
+
+
+
     *,
     url: str,
     title: str,
@@ -362,7 +460,7 @@ def scrape_jobs_ac_uk() -> list[dict]:
         "postdoctoral research associate mathematics",
         "research fellow pure mathematics",
         "postdoc mathematical physics",
-        "research associate statistics probability",
+        "PDRA mathematics",
     ]
 
     for query in query_sets:
@@ -393,11 +491,18 @@ def scrape_jobs_ac_uk() -> list[dict]:
             deadline    = item.get("closingDate", "")
             description = item.get("jobDescription", "")
 
+            # ── POSTDOC GATE ────────────────────────────────────────────────
+            # jobs.ac.uk is the noisiest source; apply the hard gate here.
+            full_text_combined = f"{title} {description}"
+            if not is_likely_postdoc(title, full_text_combined):
+                continue
+            # ────────────────────────────────────────────────────────────────
+
             jobs.append(
                 _make_job(
                     url=job_url, title=title, institution=institution,
                     location=location, country="UK",
-                    full_text=f"{title} {description}",
+                    full_text=full_text_combined,
                     salary_raw=salary_raw, deadline=deadline,
                     source="jobs.ac.uk",
                 )
@@ -628,12 +733,21 @@ def run() -> None:
 
     print(f"\n  Total fetched:  {len(all_jobs)}")
 
-    # ── Deduplicate and persist ─────────────────────────────────────────────
+    # ── Deduplicate, apply postdoc gate, and persist ────────────────────────
     new_jobs: list[dict] = []
+    skipped = 0
     for job in all_jobs:
+        # Final catch-all gate across ALL sources
+        if not is_likely_postdoc(job["title"], job.get("title", "") + " " + job.get("institution", "")):
+            # If score is 0 and title has no postdoc signal, skip silently
+            if job["relevance_score"] <= 0:
+                skipped += 1
+                continue
         if is_new(conn, job["id"]):
             insert_job(conn, job)
             new_jobs.append(job)
+
+    print(f"  Skipped (not postdoc): {skipped}")
 
     print(f"  New this run:   {len(new_jobs)}")
 

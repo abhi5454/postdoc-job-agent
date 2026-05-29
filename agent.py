@@ -176,9 +176,14 @@ def init_db(path: str) -> sqlite3.Connection:
             keywords_matched TEXT,
             relevance_score  INTEGER DEFAULT 0,
             first_seen       TEXT,
-            notified         INTEGER DEFAULT 0
+            notified         INTEGER DEFAULT 0,
+            status           TEXT DEFAULT 'active'   -- active | expired | removed
         )
     """)
+    # ── Migrate existing DBs that predate the status column ─────────────────
+    existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+    if "status" not in existing_cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN status TEXT DEFAULT 'active'")
     conn.commit()
     return conn
 
@@ -217,13 +222,25 @@ def mark_notified(conn: sqlite3.Connection, jid: str) -> None:
     conn.commit()
 
 
-def get_all_jobs(conn: sqlite3.Connection) -> list:
-    """For optional reporting."""
+def get_active_jobs(conn: sqlite3.Connection) -> list[dict]:
+    """Return all jobs with status='active', best relevance first."""
     rows = conn.execute(
-        "SELECT * FROM jobs ORDER BY relevance_score DESC, first_seen DESC"
+        """SELECT id, title, institution, location, country,
+                  salary_raw, deadline, url, source,
+                  keywords_matched, relevance_score, first_seen
+           FROM jobs
+           WHERE status = 'active'
+           ORDER BY relevance_score DESC, first_seen DESC"""
     ).fetchall()
-    cols = [d[0] for d in conn.execute("SELECT * FROM jobs LIMIT 0").description]
+    cols = ["id", "title", "institution", "location", "country",
+            "salary_raw", "deadline", "url", "source",
+            "keywords_matched", "relevance_score", "first_seen"]
     return [dict(zip(cols, r)) for r in rows]
+
+
+def set_job_status(conn: sqlite3.Connection, jid: str, status: str) -> None:
+    conn.execute("UPDATE jobs SET status=? WHERE id=?", (status, jid))
+    conn.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -309,6 +326,85 @@ def extract_salary(text: str) -> tuple[str, float | None, float | None, str | No
                 if 15_000 <= val <= 200_000:
                     return raw, val, val, currency
     return "", None, None, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEADLINE PARSING & JOB EXPIRY
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DEADLINE_FORMATS = [
+    "%Y-%m-%d",          # 2026-06-30  (ISO)
+    "%d/%m/%Y",          # 30/06/2026  (UK)
+    "%d-%m-%Y",          # 30-06-2026
+    "%d %B %Y",          # 30 June 2026
+    "%d %b %Y",          # 30 Jun 2026
+    "%B %d, %Y",         # June 30, 2026  (US)
+    "%b %d, %Y",         # Jun 30, 2026
+    "%d %B, %Y",         # 30 June, 2026
+    "%Y/%m/%d",          # 2026/06/30
+]
+
+
+def parse_deadline(raw: str) -> date | None:
+    """
+    Try to parse a deadline string into a date object.
+    Returns None if the string is empty or unrecognisable.
+    Strips ordinal suffixes (1st, 2nd, 3rd, 4th…) before trying formats.
+    """
+    if not raw:
+        return None
+    cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    for fmt in _DEADLINE_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def purge_expired_jobs(conn: sqlite3.Connection) -> tuple[int, int]:
+    """
+    Sweep all active jobs and mark them expired or removed:
+      - expired  → deadline is in the past
+      - removed  → URL returns 4xx/5xx or times out (posting taken down)
+
+    Returns (n_expired, n_removed) for reporting.
+    """
+    today = date.today()
+    active = conn.execute(
+        "SELECT id, url, deadline FROM jobs WHERE status = 'active'"
+    ).fetchall()
+
+    n_expired = 0
+    n_removed = 0
+
+    for jid, url, deadline_raw in active:
+        # ── 1. Deadline check ────────────────────────────────────────────────
+        dl = parse_deadline(deadline_raw)
+        if dl and dl < today:
+            set_job_status(conn, jid, "expired")
+            n_expired += 1
+            continue   # no need to ping the URL as well
+
+        # ── 2. URL liveness check ────────────────────────────────────────────
+        # Use HEAD first (cheap); fall back to GET if server rejects HEAD.
+        if not url:
+            continue
+        try:
+            r = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
+            if r.status_code == 405:   # Method Not Allowed → retry with GET
+                r = requests.get(url, headers=HEADERS, timeout=10, stream=True)
+            if r.status_code in (404, 410, 403, 401):
+                set_job_status(conn, jid, "removed")
+                n_removed += 1
+        except requests.RequestException:
+            # Network error ≠ removed posting; leave as active for next check
+            pass
+
+        time.sleep(0.3)   # gentle pace — checking many URLs in sequence
+
+    return n_expired, n_removed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -723,6 +819,61 @@ def format_job_message(job: dict) -> str:
     )
 
 
+def format_active_jobs_list(jobs: list[dict]) -> list[str]:
+    """
+    Build a compact current-openings list, chunked into Telegram-safe
+    messages (≤ 4000 chars each, leaving headroom for the header).
+
+    Each entry:
+        ⭐ Title — Institution
+            📅 deadline  💰 salary  🔗 link
+    """
+    CHUNK_LIMIT = 4000
+
+    def entry(job: dict) -> str:
+        stars   = "⭐" * min(3, job["relevance_score"] // 3) or "·"
+        inst    = f" — {job['institution']}" if job["institution"] else ""
+        dl      = f"  📅 {job['deadline']}" if job["deadline"] else ""
+        sal     = f"  💰 {job['salary_raw']}" if job["salary_raw"] else ""
+        country = f" ({job['country']})" if job["country"] else ""
+        return (
+            f"{stars} <a href='{job['url']}'>{job['title']}</a>"
+            f"{inst}{country}\n"
+            f"<i>{dl}{sal}</i>\n"
+        )
+
+    pages: list[str] = []
+    current = ""
+    for i, job in enumerate(jobs):
+        line = entry(job)
+        if len(current) + len(line) > CHUNK_LIMIT:
+            pages.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        pages.append(current)
+
+    # Prepend header to first page, continuation note to rest
+    if pages:
+        total = len(jobs)
+        pages[0] = (
+            f"📋 <b>All Current Openings ({total})</b>\n"
+            f"<i>Sorted by relevance · expired &amp; removed listings auto-cleaned</i>\n\n"
+        ) + pages[0]
+        for i in range(1, len(pages)):
+            pages[i] = f"📋 <b>Current Openings (cont. {i+1}/{len(pages)})</b>\n\n" + pages[i]
+
+    return pages
+
+
+def paginate_and_send(messages: list[str]) -> None:
+    """Send a list of pre-formatted message strings with rate-limit delay."""
+    for msg in messages:
+        send_telegram(msg)
+        time.sleep(1.2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -734,7 +885,12 @@ def run() -> None:
 
     conn = init_db(DB_PATH)
 
-    # ── Scrape all sources ──────────────────────────────────────────────────
+    # ── Step 1: Purge expired / removed jobs before anything else ───────────
+    print("  Checking existing listings for expiry / removed URLs ...")
+    n_expired, n_removed = purge_expired_jobs(conn)
+    print(f"    → Marked expired: {n_expired}  |  Removed (404): {n_removed}")
+
+    # ── Step 2: Scrape all sources ──────────────────────────────────────────
     scrapers = [
         ("MathJobs.org",   scrape_mathjobs),
         ("jobs.ac.uk",     scrape_jobs_ac_uk),
@@ -755,13 +911,11 @@ def run() -> None:
 
     print(f"\n  Total fetched:  {len(all_jobs)}")
 
-    # ── Deduplicate, apply postdoc gate, and persist ────────────────────────
+    # ── Step 3: Deduplicate, gate, persist ──────────────────────────────────
     new_jobs: list[dict] = []
     skipped = 0
     for job in all_jobs:
-        # Final catch-all gate across ALL sources
         if not is_likely_postdoc(job["title"], job.get("title", "") + " " + job.get("institution", "")):
-            # If score is 0 and title has no postdoc signal, skip silently
             if job["relevance_score"] <= 0:
                 skipped += 1
                 continue
@@ -770,39 +924,54 @@ def run() -> None:
             new_jobs.append(job)
 
     print(f"  Skipped (not postdoc): {skipped}")
+    print(f"  New this run:          {len(new_jobs)}")
 
-    print(f"  New this run:   {len(new_jobs)}")
-
-    # ── Sort by relevance ───────────────────────────────────────────────────
     new_jobs.sort(key=lambda j: j["relevance_score"], reverse=True)
-
-    # ── High-relevance jobs (primary keywords matched) ──────────────────────
     high_relevance = [j for j in new_jobs if j["relevance_score"] >= 6]
     any_relevance  = [j for j in new_jobs if j["relevance_score"] > 0]
 
-    # ── Notify ──────────────────────────────────────────────────────────────
-    if not new_jobs:
-        print("\n  No new jobs today — no notification sent.\n")
-    else:
-        # Summary message
-        summary = (
-            f"📬 <b>Postdoc Hunt — {date.today().isoformat()}</b>\n\n"
-            f"Found <b>{len(new_jobs)}</b> new listing(s) today.\n"
-            f"• 🔬 High relevance (dimer/combinatorics): <b>{len(high_relevance)}</b>\n"
-            f"• 📐 Any relevance: <b>{len(any_relevance)}</b>\n"
-            f"• 📋 All new (broad math postdoc): <b>{len(new_jobs)}</b>"
-        )
-        send_telegram(summary)
-        time.sleep(1)
+    # ── Step 4: Fetch current active jobs (for bottom section) ──────────────
+    active_jobs = get_active_jobs(conn)
+    print(f"  Active in DB:          {len(active_jobs)}")
 
-        # Send top 10 by relevance
-        to_notify = new_jobs[:10]
-        for job in to_notify:
+    # ── Step 5: Notify ──────────────────────────────────────────────────────
+    if not new_jobs:
+        # ── Heartbeat: no new jobs ───────────────────────────────────────────
+        send_telegram(
+            f"✅ <b>Postdoc Agent — {date.today().isoformat()}</b>\n\n"
+            f"No new listings found today.\n"
+            f"🗑️ Cleaned: {n_expired} expired · {n_removed} removed\n"
+            f"📦 Active listings in tracker: <b>{len(active_jobs)}</b>\n"
+            f"<i>Next check tomorrow at 07:30 UTC</i>"
+        )
+        time.sleep(1.2)
+        print("  Heartbeat sent.")
+    else:
+        # ── Header summary ───────────────────────────────────────────────────
+        send_telegram(
+            f"📬 <b>Postdoc Hunt — {date.today().isoformat()}</b>\n\n"
+            f"🆕 New listings today: <b>{len(new_jobs)}</b>\n"
+            f"  • 🔬 High relevance (dimer/combinatorics): <b>{len(high_relevance)}</b>\n"
+            f"  • 📐 Any relevance match: <b>{len(any_relevance)}</b>\n\n"
+            f"🗑️ Cleaned today: {n_expired} expired · {n_removed} removed\n"
+            f"📦 Total active after cleanup: <b>{len(active_jobs)}</b>"
+        )
+        time.sleep(1.2)
+
+        # ── New jobs — full detail cards, top 10 ────────────────────────────
+        for job in new_jobs[:10]:
             send_telegram(format_job_message(job))
             mark_notified(conn, job["id"])
-            time.sleep(1.2)   # Telegram rate limit: ~1 msg/sec
+            time.sleep(1.2)
 
-    # ── Local summary report ────────────────────────────────────────────────
+    # ── Step 6: Current openings list (always sent, new jobs or not) ────────
+    if active_jobs:
+        pages = format_active_jobs_list(active_jobs)
+        paginate_and_send(pages)
+    else:
+        send_telegram("📋 <b>Current Openings</b>\n\nNo active listings in tracker yet.")
+
+    # ── Local console summary ────────────────────────────────────────────────
     print("\n  ── Today's top hits ──")
     for job in new_jobs[:5]:
         print(f"  [{job['relevance_score']:2d}] {job['title'][:60]}")

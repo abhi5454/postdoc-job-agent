@@ -376,7 +376,7 @@ def is_likely_postdoc(title: str, full_text: str) -> bool:
     return False
 
 
-
+def _make_job(
     *,
     url: str,
     title: str,

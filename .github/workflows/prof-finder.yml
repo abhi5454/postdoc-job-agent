@@ -54,6 +54,7 @@ jobs:
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Upload CSV as downloadable artifact
         uses: actions/upload-artifact@v4

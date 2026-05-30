@@ -511,52 +511,60 @@ def _make_job(
 
 def scrape_mathjobs() -> list[dict]:
     """
-    MathJobs.org is THE primary global math postdoc board (run by AMS).
-    We search the POSTDOC category and parse the HTML listing table.
+    MathJobs.org — uses the RSS feed discovered in the page <head>.
+    RSS is far more reliable than HTML scraping: structured, fast, no selector drift.
+
+    Full feed:     https://www.mathjobs.org/jobs?joblist-0-----rss--
+    POSTDOC feed:  https://www.mathjobs.org/jobs?joblist-0-POSTDOC---rss--
+    (URL pattern:  joblist-{start}-{jobtype}-{country}-{state}-{city}-rss--)
     """
+    import feedparser
+
     jobs = []
-    base = "https://www.mathjobs.org"
-    queries = [
-        f"{base}/jobs/list?jobtype=POSTDOC&keywords=combinatorics",
-        f"{base}/jobs/list?jobtype=POSTDOC&keywords=statistical+mechanics",
-        f"{base}/jobs/list?jobtype=POSTDOC&keywords=dimer",
-        f"{base}/jobs/list?jobtype=POSTDOC&keywords=mathematical+physics",
-        f"{base}/jobs/list?jobtype=POSTDOC",   # broad sweep
+    feeds = [
+        "https://www.mathjobs.org/jobs?joblist-0-POSTDOC---rss--",     # postdocs only
+        "https://www.mathjobs.org/jobs?joblist-0-FACULTY---rss--",     # faculty (asst prof etc)
     ]
-    seen = set()
+    seen: set[str] = set()
 
-    for url in queries:
-        resp = _get(url)
-        if not resp:
+    for feed_url in feeds:
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            print(f"    ⚠ MathJobs RSS error ({feed_url}): {e}")
             continue
-        soup = BeautifulSoup(resp.text, "html.parser")
 
-        # MathJobs uses a table — rows have class 'std-row' or similar
-        rows = soup.select("tr") or []
-        for row in rows:
-            link = row.select_one("a[href*='/jobs/']")
-            if not link:
+        for entry in feed.entries:
+            job_url = entry.get("link", "").strip()
+            title   = entry.get("title", "").strip()
+
+            if not job_url or not title or job_url in seen:
                 continue
-            title = link.get_text(strip=True)
-            href  = link.get("href", "")
-            if not title or not href or href in seen:
-                continue
-            seen.add(href)
-            job_url = urljoin(base, href)
+            seen.add(job_url)
 
-            cells = row.find_all("td")
-            institution = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-            location    = cells[2].get_text(strip=True) if len(cells) > 2 else ""
-            deadline    = cells[-1].get_text(strip=True) if cells else ""
+            # RSS summary contains institution, location, deadline as plain text
+            summary = entry.get("summary", "") or entry.get("description", "")
+            # Strip HTML tags from summary
+            summary_text = BeautifulSoup(summary, "html.parser").get_text(" ", strip=True)
 
-            full_text = row.get_text(" ", strip=True)
+            # MathJobs RSS title format: "Title, Institution (City, Country)"
+            institution = ""
+            if "," in title:
+                parts = title.split(",", 1)
+                institution = parts[-1].strip().split("(")[0].strip()
+
+            # Published date as deadline proxy (actual deadline in summary)
+            published = entry.get("published", "")
+
             jobs.append(
                 _make_job(
                     url=job_url, title=title, institution=institution,
-                    location=location, country="", full_text=full_text,
-                    deadline=deadline, source="MathJobs.org",
+                    location="", country="",
+                    full_text=f"{title} {summary_text}",
+                    deadline=published, source="MathJobs.org",
                 )
             )
+
         time.sleep(POLITE_DELAY)
 
     return jobs
@@ -567,11 +575,12 @@ def scrape_mathjobs() -> list[dict]:
 def scrape_jobs_ac_uk() -> list[dict]:
     """
     jobs.ac.uk — UK's leading academic job board.
-    Uses their JSON search endpoint (no auth required).
+    Diagnostic confirmed: HTML search only (no JSON API).
+    Job cards use class .j-search-result__result (25 per page confirmed).
     """
     jobs = []
-    base_url = "https://www.jobs.ac.uk/search/json"
-    seen = set()
+    base_url = "https://www.jobs.ac.uk/search/"
+    seen: set[str] = set()
 
     query_sets = [
         "postdoc mathematics combinatorics",
@@ -584,43 +593,63 @@ def scrape_jobs_ac_uk() -> list[dict]:
     for query in query_sets:
         params = {
             "keywords": query,
-            "academicDiscipline": "mathematics-and-statistics",
-            "rows": 50,
+            "academicDisciplineFacet[0]": "mathematics-and-statistics",
+            "rows": "25",
         }
         resp = _get(base_url, params=params)
-        if not resp:
+        if not resp or isinstance(resp, dict):
             continue
 
-        try:
-            data = resp.json()
-        except Exception:
-            continue
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        for item in data.get("jobs", []):
-            job_url = item.get("jobUrl") or item.get("url", "")
-            if not job_url or job_url in seen:
+        for card in soup.select(".j-search-result__result"):
+            # Title is in the first <h4> link inside the card
+            title_el = card.select_one("h4 a") or card.select_one("a[href*='/job/']")
+            if not title_el:
+                continue
+            title   = title_el.get_text(strip=True)
+            href    = title_el.get("href", "")
+            job_url = urljoin("https://www.jobs.ac.uk", href)
+
+            if not title or job_url in seen:
                 continue
             seen.add(job_url)
 
-            title       = item.get("jobTitle", "")
-            institution = item.get("employerName", "")
-            location    = item.get("location", "")
-            salary_raw  = item.get("salary", "")
-            deadline    = item.get("closingDate", "")
-            description = item.get("jobDescription", "")
+            # Institution — usually in the first <p> or <strong> after the title
+            institution = ""
+            for el in card.select("p, strong, .j-search-result__employer"):
+                text = el.get_text(strip=True)
+                if text and len(text) < 120 and "£" not in text:
+                    institution = text
+                    break
 
-            # ── POSTDOC GATE ────────────────────────────────────────────────
-            # jobs.ac.uk is the noisiest source; apply the hard gate here.
-            full_text_combined = f"{title} {description}"
-            if not is_likely_postdoc(title, full_text_combined):
+            # Salary — look for £ sign
+            salary_raw = ""
+            for el in card.select("p, span, .j-search-result__salary"):
+                text = el.get_text(strip=True)
+                if "£" in text or "salary" in text.lower():
+                    salary_raw = text
+                    break
+
+            # Deadline — .j-search-result__date confirmed in diagnostic (50 = 2×25)
+            deadline = ""
+            for el in card.select(".j-search-result__date, .j-search-result__date-span"):
+                text = el.get_text(strip=True)
+                if text and any(c.isdigit() for c in text):
+                    deadline = text
+                    break
+
+            full_text = f"{title} {institution} {card.get_text(' ', strip=True)}"
+
+            # Apply postdoc gate — noisiest source
+            if not is_likely_postdoc(title, full_text):
                 continue
-            # ────────────────────────────────────────────────────────────────
 
             jobs.append(
                 _make_job(
                     url=job_url, title=title, institution=institution,
-                    location=location, country="UK",
-                    full_text=full_text_combined,
+                    location="", country="UK",
+                    full_text=full_text,
                     salary_raw=salary_raw, deadline=deadline,
                     source="jobs.ac.uk",
                 )
@@ -635,43 +664,60 @@ def scrape_jobs_ac_uk() -> list[dict]:
 def scrape_ems_jobs() -> list[dict]:
     """
     euromathsoc.org/jobs — EMS aggregates EU + UK math positions.
-    Simple HTML listing, easy to parse.
+    Diagnostic: Next.js SSR site — content IS server-rendered in HTML.
+    Job links follow pattern: /jobs/<slug>-<id>  (e.g. /jobs/two-postdocs-1791)
+    The .row / .cell grid holds the listing table (31 rows × 5 cells confirmed).
     """
     jobs = []
-    url = "https://euromathsoc.org/jobs"
+    base = "https://euromathsoc.org"
+    url  = f"{base}/jobs"
     resp = _get(url)
-    if not resp:
+    if not resp or isinstance(resp, dict):
         return jobs
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # EMS wraps each posting in a card/article with a title link
-    for item in soup.select("article, .job-item, .position, li.vacancy, .listing-item"):
-        link = item.select_one("a[href]")
-        if not link:
-            continue
-        title = link.get_text(strip=True)
-        href  = link.get("href", "")
-        if not title:
-            continue
-        job_url = urljoin(url, href)
+    # Non-job hrefs to skip
+    skip = {"/jobs", "/jobs/submit", "/jobs/map", "/jobs/industry", "/jobs/academia"}
+    seen: set[str] = set()
 
-        full_text   = item.get_text(" ", strip=True)
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+
+        # Must match /jobs/<slug> pattern — not a bare section link
+        if not re.match(r"^/jobs/[a-z0-9]", href):
+            continue
+        if href in skip or href in seen:
+            continue
+        seen.add(href)
+
+        job_url = base + href
+
+        # Link text is concatenated "Title  Institution  City, Country"
+        # Split on 2+ spaces or newlines — EMS packs them together
+        raw_text  = a.get_text(" ", strip=True)
+        # Try to grab the parent row for richer context
+        parent    = a.find_parent("div") or a
+        full_text = parent.get_text(" ", strip=True)
+
+        # Title is usually everything before the institution name
+        # Heuristic: take up to the first known university-signal word
+        title       = raw_text[:120].strip()
         institution = ""
-        for el in item.select(".institution, .university, .employer, .org"):
-            institution = el.get_text(strip=True)
-            break
+        country     = "Europe"
 
+        # Extract deadline from a sibling <time> or text containing a year
         deadline = ""
-        for el in item.select(".deadline, .closing, time"):
-            deadline = el.get_text(strip=True)
+        for el in parent.find_all("time"):
+            deadline = el.get("datetime") or el.get_text(strip=True)
             break
 
         jobs.append(
             _make_job(
                 url=job_url, title=title, institution=institution,
-                location="", country="Europe", full_text=full_text,
-                deadline=deadline, source="EMS Jobs",
+                location="", country=country,
+                full_text=full_text, deadline=deadline,
+                source="EMS Jobs",
             )
         )
 
@@ -683,36 +729,74 @@ def scrape_ems_jobs() -> list[dict]:
 
 def scrape_mathhire() -> list[dict]:
     """
-    mathhire.org — recommended by EMS; EU-heavy, clean HTML.
+    mathhire.org — EU-heavy math job board.
+    Diagnostic confirmed: Bootstrap table, each job is a <tr> containing:
+      - <strong> with the job title
+      - <a href="/jobs/NNNN"> for the link
+      - <time> for deadline
+      - <small> / .text-muted for metadata (institution, location)
+    41 <tr> rows and 42 <strong> tags found = ~40 job listings.
     """
-    jobs = []
-    url  = "https://mathhire.org/jobs"
-    resp = _get(url)
-    if not resp:
-        return jobs
+    jobs  = []
+    base  = "https://mathhire.org"
+    pages = [
+        f"{base}/jobs/academia",   # academic postdocs and faculty
+        f"{base}/jobs",            # all jobs (catches any missed by academia filter)
+    ]
+    seen: set[str] = set()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    for item in soup.select(".job-listing, .position, article, .card"):
-        link = item.select_one("h2 a, h3 a, .title a, a.job-title, a[href*='/job']")
-        if not link:
+    for url in pages:
+        resp = _get(url)
+        if not resp or isinstance(resp, dict):
             continue
-        title = link.get_text(strip=True)
-        href  = link.get("href", "")
-        if not title:
-            continue
-        job_url = urljoin(url, href)
 
-        full_text = item.get_text(" ", strip=True)
-        jobs.append(
-            _make_job(
-                url=job_url, title=title, institution="",
-                location="", country="Europe", full_text=full_text,
-                source="MathHire.org",
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for tr in soup.find_all("tr"):
+            # Each job row has a link to /jobs/NNNN and a <strong> title
+            link = tr.select_one("a[href^='/jobs/']")
+            strong = tr.select_one("strong")
+            if not link or not strong:
+                continue
+
+            href    = link.get("href", "")
+            job_url = base + href
+            if job_url in seen:
+                continue
+            seen.add(job_url)
+
+            title = strong.get_text(strip=True)
+            if not title:
+                continue
+
+            # Institution and location — in <small> or .text-muted spans
+            institution = ""
+            location    = ""
+            smalls = tr.select("small, .text-muted")
+            if smalls:
+                institution = smalls[0].get_text(strip=True)
+            if len(smalls) > 1:
+                location = smalls[1].get_text(strip=True)
+
+            # Deadline — <time datetime="YYYY-MM-DD">
+            deadline = ""
+            time_el  = tr.select_one("time")
+            if time_el:
+                deadline = time_el.get("datetime") or time_el.get_text(strip=True)
+
+            full_text = tr.get_text(" ", strip=True)
+
+            jobs.append(
+                _make_job(
+                    url=job_url, title=title, institution=institution,
+                    location=location, country="Europe",
+                    full_text=full_text, deadline=deadline,
+                    source="MathHire.org",
+                )
             )
-        )
 
-    time.sleep(POLITE_DELAY)
+        time.sleep(POLITE_DELAY)
+
     return jobs
 
 
@@ -720,43 +804,79 @@ def scrape_mathhire() -> list[dict]:
 
 def scrape_euraxess() -> list[dict]:
     """
-    euraxess.ec.europa.eu — EC portal covering 40+ countries.
-    Searches via their public search URL.
+    euraxess.ec.europa.eu — EU Commission research portal.
+    Diagnostic confirmed: 200 OK, 11 <article> tags = 11 job cards per page.
+    Uses ECL (European Component Library) CSS: .ecl-link, .ecl-u-type-bold etc.
+    Job links follow /jobs/<id> pattern.
     """
     jobs  = []
     base  = "https://euraxess.ec.europa.eu"
-    url   = f"{base}/jobs/search"
-    params = {
-        "query": "postdoc mathematics combinatorics",
-        "format": "json",   # may or may not be supported; fallback to HTML parse
-    }
+    seen: set[str] = set()
 
-    resp = _get(url, params={"query": "postdoc mathematics"})
-    if not resp:
-        return jobs
+    search_urls = [
+        f"{base}/jobs/search?keywords=postdoc+mathematics",
+        f"{base}/jobs/search?keywords=postdoc+combinatorics",
+        f"{base}/jobs/search?keywords=research+fellow+mathematics",
+    ]
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    for item in soup.select(".job-item, .views-row, article.node--type-jobs"):
-        link = item.select_one("a[href]")
-        if not link:
+    for url in search_urls:
+        resp = _get(url)
+        if not resp or isinstance(resp, dict):
             continue
-        title = link.get_text(strip=True)
-        href  = link.get("href", "")
-        if not title:
-            continue
-        job_url = urljoin(base, href)
 
-        full_text = item.get_text(" ", strip=True)
-        jobs.append(
-            _make_job(
-                url=job_url, title=title, institution="",
-                location="", country="Europe", full_text=full_text,
-                source="EURAXESS",
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Diagnostic: 11 <article> tags confirmed — each is a job card
+        for article in soup.find_all("article"):
+            # Title — in <h3> or .ecl-u-type-bold / .ecl-u-type-m
+            h3 = article.select_one("h3")
+            title_el = (
+                h3.select_one("a") if h3 else None
+            ) or article.select_one("a.ecl-link--standalone")
+
+            if not title_el:
+                continue
+
+            title = title_el.get_text(strip=True)
+            href  = title_el.get("href", "")
+            if not title or not href:
+                continue
+
+            job_url = urljoin(base, href)
+            if job_url in seen:
+                continue
+            seen.add(job_url)
+
+            full_text = article.get_text(" ", strip=True)
+
+            # Institution and country — in .ecl-u-type-m spans
+            institution = ""
+            country     = "Europe"
+            for span in article.select(".ecl-u-type-m, .ecl-u-type-bold"):
+                text = span.get_text(strip=True)
+                if text and len(text) < 100:
+                    institution = text
+                    break
+
+            # Deadline
+            deadline = ""
+            for el in article.select("time, .ecl-u-type-color-grey"):
+                text = el.get("datetime") or el.get_text(strip=True)
+                if text and any(c.isdigit() for c in text):
+                    deadline = text
+                    break
+
+            jobs.append(
+                _make_job(
+                    url=job_url, title=title, institution=institution,
+                    location="", country=country,
+                    full_text=full_text, deadline=deadline,
+                    source="EURAXESS",
+                )
             )
-        )
 
-    time.sleep(POLITE_DELAY)
+        time.sleep(POLITE_DELAY)
+
     return jobs
 
 

@@ -575,11 +575,13 @@ def scrape_mathjobs() -> list[dict]:
 def scrape_jobs_ac_uk() -> list[dict]:
     """
     jobs.ac.uk — UK's leading academic job board.
-    Diagnostic confirmed: HTML search only (no JSON API).
-    Job cards use class .j-search-result__result (25 per page confirmed).
+    IMPORTANT: /search/ loads results via JavaScript — nothing to scrape.
+    /search/json (despite the name) returns pre-rendered HTML WITH job cards.
+    Confirmed by diagnostic: .j-search-result__result appears 25x in /search/json
+    but is completely absent from /search/. Use /search/json and parse as HTML.
     """
     jobs = []
-    base_url = "https://www.jobs.ac.uk/search/"
+    base_url = "https://www.jobs.ac.uk/search/json"
     seen: set[str] = set()
 
     query_sets = [

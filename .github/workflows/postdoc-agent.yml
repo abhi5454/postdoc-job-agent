@@ -85,6 +85,7 @@ jobs:
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       # ── 6. Optional: upload DB as an artifact for manual inspection ────────
       - name: Upload database snapshot

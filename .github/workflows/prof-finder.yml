@@ -1,0 +1,64 @@
+# .github/workflows/prof-finder.yml
+#
+# Runs the professor finder weekly (Sunday midnight UTC).
+# Uses the same repo secrets as the job agent.
+# Outputs: profs.db + professors_ranked.csv (both committed back to repo)
+#
+# This runs weekly (not daily) because professor profiles change slowly.
+# You can also trigger it manually from the Actions tab at any time.
+
+name: Professor Finder
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"   # Every Sunday at midnight UTC
+  workflow_dispatch:        # Allow manual trigger from Actions tab
+
+jobs:
+  find-professors:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run professor finder
+        env:
+          CONTACT_EMAIL:      ${{ secrets.CONTACT_EMAIL }}      # for OpenAlex polite pool
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROFS_DB_PATH:      profs.db
+        run: python prof_finder.py
+
+      - name: Commit results
+        run: |
+          git config --local user.email "prof-finder-bot@github-actions"
+          git config --local user.name  "Prof Finder Bot"
+          git add profs.db professors_ranked.csv
+          git diff --staged --quiet || git commit -m "chore: update professor list $(date -I)"
+          git pull --rebase --autostash origin main
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload CSV as downloadable artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: professors-ranked-${{ github.run_number }}
+          path: professors_ranked.csv
+          retention-days: 90   # keep 3 months of snapshots
